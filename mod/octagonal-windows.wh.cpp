@@ -36,7 +36,7 @@ snapped windows is based on a
 [mod](https://github.com/ramensoftware/windhawk-mods/pull/5022) by [Alexey
 Lavrinenko](https://github.com/leshaalexey). I modified the mod [Custom Window Corner Radius](https://windhawk.net/mods/custom-corner-radius) from [m417z](https://github.com/m417z).
 
-![Octagonal Windows](https://raw.githubusercontent.com/JER-10000/windhawk-mods/resource/octagonal-window-corners.png)
+![Octagonal Windows](https://raw.githubusercontent.com/JER-10000/windhawk-mods/main/images/octagonal-windows.png)
 
 ## ⚠ Important usage note ⚠
 
