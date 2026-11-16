@@ -2,7 +2,7 @@
 // @id              octagonal-windows
 // @name            Octagonal Windows
 // @description     Makes Windows 11 window borders octagonal.
-// @version         1.0.1
+// @version         1.0.2
 // @author          JER-10000
 // @github          https://github.com/JER-10000
 // @include         dwm.exe
@@ -57,6 +57,10 @@ and make sure that `dwm.exe` is in the list.
 - Windows 11 squares off the corners of maximized and snapped windows. The
   "beveled corners for maximized and snapped windows" option enables beveling
   for them.
+- Window content can only be clipped with rounded corners, so inside each
+  beveled corner there is a small area between the border and the content.
+  The "Fill corner gap" option fills it with the border color. Without it, the
+  rounded corner of the content shows inside the bevel.
 - Some elements, such as the taskbar, the Start menu, and the notification
   center, are unaffected by this mod. Some of them can be customized using other
   mods, such as Windows 11 Taskbar Styler.
@@ -121,6 +125,11 @@ A dark taskbar background combined with the Lucent style from Windows 11 Taskbar
   - none: Leave them square
   - snapped: Bevel snapped windows
   - snappedAndMaximized: Bevel snapped and maximized windows
+- fillCornerGap: true
+  $name: Fill corner gap
+  $description: >-
+    Fill the small area between the beveled border and the rounded corner of
+    the window content with the border color.
 - excludedPrograms: [""]
   $name: Excluded programs
   $description: >-
@@ -177,6 +186,7 @@ struct {
     // largest of them.
     float cornerRadiusDelta[kCornerCount];
     bool perCornerRadius;
+    bool fillCornerGap;
     float smallRadius;
     float tooltipRadius;
     RoundMaximizedAndSnapped roundMaximizedAndSnapped;
@@ -538,6 +548,20 @@ struct CornerRadiusDeltas {
 
 thread_local const CornerRadiusDeltas* g_cornerRadiusDeltas;
 
+// The content clip is inset by this many pixels and its corner radius is
+// scaled by this factor, which keeps the rounded content inside the bevel.
+constexpr int kContentClipInset = 1;
+constexpr float kContentClipRadiusMultiplier = 1.6f;
+
+// When the corner gap is filled, this is added to the corner radius of the
+// border's inner edge before it is scaled like the content clip, in pixels at
+// 96 DPI. It makes the border overlap the content's corner slightly, so no thin
+// line of the background is left between the two.
+constexpr float kCornerGapOverlap = 2.5f;
+
+// DPI of the border surface being drawn, set by CreateBorderSurface_Hook.
+thread_local int g_borderSurfaceDpi = 96;
+
 class CornerRadiusDeltasScope {
    public:
     explicit CornerRadiusDeltasScope(const CornerRadiusDeltas* deltas)
@@ -638,8 +662,8 @@ long WINAPI SetRectangle_Hook(void* pThis,
         bottomLeftX = bottomLeftY = AdjustedCornerRadius(bottomLeftX, 2);
         bottomRightX = bottomRightY = AdjustedCornerRadius(bottomRightX, 3);
         
-        int borderThickness = 1;
-        float radiusMultiplier = 1.6;
+        int borderThickness = kContentClipInset;
+        float radiusMultiplier = kContentClipRadiusMultiplier;
 
         return SetRectangle_Original(pThis, left + borderThickness, top + borderThickness, right - borderThickness, bottom - borderThickness, topLeftX*radiusMultiplier,
                                  topLeftY*radiusMultiplier, topRightX*radiusMultiplier, topRightY*radiusMultiplier, bottomLeftX*radiusMultiplier,
@@ -718,6 +742,68 @@ HRESULT CreateAdjustedRoundedRectangleGeometry(ID2D1Factory* factory,
     return S_OK;
 }
 
+// The inner edge of the border when the corner gap is filled: rounded corners
+// that follow the content clip, reaching slightly into the content, so the
+// border covers the area between the bevel and the content.
+HRESULT CreateCornerGapFillGeometry(ID2D1Factory* factory,
+                                    const D2D1_RECT_F& rect,
+                                    float radius,
+                                    ID2D1PathGeometry** geometry) {
+    float maxRadius =
+        std::min(rect.right - rect.left, rect.bottom - rect.top) / 2;
+    float overlap = kCornerGapOverlap * g_borderSurfaceDpi / 96.0f;
+    float radii[kCornerCount];
+    for (int i = 0; i < kCornerCount; i++) {
+        radii[i] = std::min(
+            (AdjustedCornerRadius(radius, i) + overlap) *
+                kContentClipRadiusMultiplier,
+            maxRadius);
+    }
+
+    winrt::com_ptr<ID2D1PathGeometry> path;
+    HRESULT hr = factory->CreatePathGeometry(path.put());
+    if (FAILED(hr)) {
+        return hr;
+    }
+
+    winrt::com_ptr<ID2D1GeometrySink> sink;
+    hr = path->Open(sink.put());
+    if (FAILED(hr)) {
+        return hr;
+    }
+
+    auto arc = [&](float x, float y, float r) {
+        if (r > 0) {
+            sink->AddArc(D2D1::ArcSegment(
+                D2D1::Point2F(x, y), D2D1::SizeF(r, r), 0.0f,
+                D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_SMALL));
+        } else {
+            sink->AddLine(D2D1::Point2F(x, y));
+        }
+    };
+
+    // Clockwise from the top edge.
+    sink->BeginFigure(D2D1::Point2F(rect.left + radii[0], rect.top),
+                      D2D1_FIGURE_BEGIN_FILLED);
+    sink->AddLine(D2D1::Point2F(rect.right - radii[1], rect.top));
+    arc(rect.right, rect.top + radii[1], radii[1]);
+    sink->AddLine(D2D1::Point2F(rect.right, rect.bottom - radii[3]));
+    arc(rect.right - radii[3], rect.bottom, radii[3]);
+    sink->AddLine(D2D1::Point2F(rect.left + radii[2], rect.bottom));
+    arc(rect.left, rect.bottom - radii[2], radii[2]);
+    sink->AddLine(D2D1::Point2F(rect.left, rect.top + radii[0]));
+    arc(rect.left + radii[0], rect.top, radii[0]);
+    sink->EndFigure(D2D1_FIGURE_END_CLOSED);
+
+    hr = sink->Close();
+    if (FAILED(hr)) {
+        return hr;
+    }
+
+    *geometry = path.detach();
+    return S_OK;
+}
+
 using FillRoundedRectangle_t = void(WINAPI*)(ID2D1RenderTarget* pThis,
                                              const D2D1_ROUNDED_RECT* rect,
                                              ID2D1Brush* brush);
@@ -775,8 +861,11 @@ CreateRoundedRectangleGeometry_Hook(ID2D1Factory* pThis,
     if (g_cornerRadiusDeltas) {
         Wh_Log(L"> %f", rect->radiusX);
         winrt::com_ptr<ID2D1PathGeometry> path;
-        HRESULT hr = CreateAdjustedRoundedRectangleGeometry(
-            pThis, rect->rect, rect->radiusX, path.put());
+        HRESULT hr = g_settings.fillCornerGap
+                         ? CreateCornerGapFillGeometry(
+                               pThis, rect->rect, rect->radiusX, path.put())
+                         : CreateAdjustedRoundedRectangleGeometry(
+                               pThis, rect->rect, rect->radiusX, path.put());
         if (SUCCEEDED(hr)) {
             // The border code only combines the result with another geometry
             // and releases it, which any ID2D1Geometry supports.
@@ -806,6 +895,7 @@ long WINAPI CreateBorderSurface_Hook(float radius,
                                      int shadowStyle,
                                      void** surface) {
     Wh_Log(L"> %f dpi=%d", radius, dpi);
+    g_borderSurfaceDpi = dpi;
 
     CornerRadiusDeltas deltas;
     bool perCorner = IsPerCornerRadius(radius);
@@ -1287,6 +1377,8 @@ void LoadSettings() {
     g_settings.smallRadius = FloatAbove(Wh_GetIntSetting(L"smallRadius"), 1);
     g_settings.tooltipRadius =
         FloatAbove(Wh_GetIntSetting(L"tooltipRadius"), 1);
+
+    g_settings.fillCornerGap = Wh_GetIntSetting(L"fillCornerGap");
 
     PCWSTR roundMaximizedAndSnapped =
         Wh_GetStringSetting(L"roundMaximizedAndSnapped");
